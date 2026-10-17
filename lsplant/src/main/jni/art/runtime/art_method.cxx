@@ -5,6 +5,7 @@ module;
 #include <string>
 
 #include "logging.hpp"
+#include "layout_probe.hpp"
 
 export module lsplant:art_method;
 
@@ -233,11 +234,36 @@ public:
             return false;
         }
 
+        std::vector<jfieldID> flags_fields;
         if (sdk_int >= kSdkMarshmallow) [[likely]] {
-            if (art_method_field = JNI_GetFieldID(env, executable, "artMethod", "J");
-                !art_method_field) {
-                LOGE("Failed to find artMethod field");
-                return false;
+            // Discover reflected storage by primitive type. Private field names
+            // may change independently of the public reflection API.
+            auto class_class = env->FindClass("java/lang/Class");
+            auto field_class = env->FindClass("java/lang/reflect/Field");
+            auto long_class = env->FindClass("java/lang/Long");
+            auto int_class = env->FindClass("java/lang/Integer");
+            auto get_fields = env->GetMethodID(class_class, "getDeclaredFields", "()[Ljava/lang/reflect/Field;");
+            auto get_type = env->GetMethodID(field_class, "getType", "()Ljava/lang/Class;");
+            auto get_modifiers = env->GetMethodID(field_class, "getModifiers", "()I");
+            auto long_type = env->GetStaticObjectField(long_class, env->GetStaticFieldID(long_class, "TYPE", "Ljava/lang/Class;"));
+            auto int_type = env->GetStaticObjectField(int_class, env->GetStaticFieldID(int_class, "TYPE", "Ljava/lang/Class;"));
+            auto fields = static_cast<jobjectArray>(env->CallObjectMethod(executable.get(), get_fields));
+            if (env->ExceptionCheck() || !fields) return false;
+            size_t pointer_fields = 0;
+            for (jsize i = 0; i < env->GetArrayLength(fields); ++i) {
+                auto field = env->GetObjectArrayElement(fields, i);
+                auto type = env->CallObjectMethod(field, get_type);
+                if ((env->CallIntMethod(field, get_modifiers) & 8) == 0) {
+                    if (env->IsSameObject(type, long_type)) { art_method_field = env->FromReflectedField(field); ++pointer_fields; }
+                    if (env->IsSameObject(type, int_type)) flags_fields.push_back(env->FromReflectedField(field));
+                }
+                env->DeleteLocalRef(type); env->DeleteLocalRef(field);
+            }
+            env->DeleteLocalRef(fields); env->DeleteLocalRef(long_type); env->DeleteLocalRef(int_type);
+            env->DeleteLocalRef(long_class); env->DeleteLocalRef(int_class);
+            env->DeleteLocalRef(field_class); env->DeleteLocalRef(class_class);
+            if (env->ExceptionCheck() || pointer_fields != 1 || !art_method_field || flags_fields.empty()) {
+                LOGE("Missing/ambiguous reflected primitive storage"); return false;
             }
         }
 
@@ -257,36 +283,107 @@ public:
             return false;
         }
         auto first_ctor = constructors[0];
-        auto second_ctor = constructors[1];
         auto *first = FromReflectedMethod(env, first_ctor.get());
-        auto *second = FromReflectedMethod(env, second_ctor.get());
-        art_method_size = reinterpret_cast<uintptr_t>(second) - reinterpret_cast<uintptr_t>(first);
+        std::vector<uintptr_t> method_addresses;
+        for (size_t i = 0; i < constructors.size(); ++i) {
+            auto address = reinterpret_cast<uintptr_t>(FromReflectedMethod(env, constructors[i].get()));
+            if (!address || address % sizeof(uint32_t) || env->ExceptionCheck()) return false;
+            method_addresses.push_back(address);
+        }
+        art_method_size = lsplant_layout_probe::stride(method_addresses, kPointerSize);
+        if (!art_method_size) { LOGE("Unable to infer a bounded ArtMethod stride"); return false; }
         LOGD("ArtMethod size: %zu", art_method_size);
 
-        if (__builtin_align_up(4 * 9, kPointerSize) + kPointerSize * 3 < art_method_size) [[unlikely]] {
-            if (sdk_int >= kSdkMarshmallow) {
-                LOGW("ArtMethod size exceeds maximum assume. There may be something wrong.");
-            }
+        // Registered JNI functions and the actual ART generic-JNI predicate
+        // provide independent data/quick-entry witnesses. Never guess the last
+        // slots in the structure when a layout cannot be established.
+        auto probes = handler.native_method_probes();
+        if (probes.size() < 4 || probes.size() > 32) { LOGE("Missing bounded independent JNI class witnesses"); return false; }
+        auto get_declaring_class = JNI_GetMethodID(env, executable, "getDeclaringClass", "()Ljava/lang/Class;");
+        if (!get_declaring_class || env->ExceptionCheck()) return false;
+        std::vector<uintptr_t> native_addresses;
+        std::vector<jclass> native_classes;
+        std::vector<size_t> native_groups;
+        std::vector<std::vector<uintptr_t>> native_class_addresses;
+        std::vector<std::pair<uintptr_t,uintptr_t>> data_samples, entry_samples;
+        for (const auto& probe : probes) {
+            if (!probe.reflected_method || !probe.native_function || !probe.quick_entry || !probe.declaring_class) return false;
+            auto actual_class = JNI_CallObjectMethod(env, probe.reflected_method, get_declaring_class);
+            if (env->ExceptionCheck() || !actual_class || !JNI_IsSameObject(env,actual_class,probe.declaring_class)) return false;
+            size_t group=0;
+            while(group<native_classes.size()&&!env->IsSameObject(native_classes[group],probe.declaring_class))++group;
+            if(group==native_classes.size()){native_classes.push_back(probe.declaring_class);native_class_addresses.emplace_back();}
+            auto address = reinterpret_cast<uintptr_t>(FromReflectedMethod(env, probe.reflected_method));
+            if (!address || address % sizeof(uint32_t) || env->ExceptionCheck()) return false;
+            native_addresses.push_back(address);
+            native_groups.push_back(group);native_class_addresses[group].push_back(address);
+            data_samples.emplace_back(address, reinterpret_cast<uintptr_t>(probe.native_function));
+            entry_samples.emplace_back(address, reinterpret_cast<uintptr_t>(probe.quick_entry));
+        }
+        if (native_classes.size()<2 ||
+            !std::all_of(native_class_addresses.begin(),native_class_addresses.end(),[](const auto& group){return lsplant_layout_probe::stride(group,kPointerSize)==art_method_size;}) ||
+            data_samples[0].second == data_samples[1].second ||
+            !lsplant_layout_probe::pointer_offset(data_samples, art_method_size, data_offset) ||
+            !lsplant_layout_probe::pointer_offset(entry_samples, art_method_size, entry_point_offset) ||
+            data_offset == entry_point_offset) {
+            LOGE("Missing/ambiguous JNI data/quick-entry layout"); return false;
         }
 
-        entry_point_offset = art_method_size - kPointerSize;
-        data_offset = entry_point_offset - kPointerSize;
-
         if (sdk_int >= kSdkMarshmallow) [[likely]] {
-            if (auto access_flags_field = JNI_GetFieldID(env, executable, "accessFlags", "I");
-                access_flags_field) {
-                uint32_t real_flags = JNI_GetIntField(env, first_ctor, access_flags_field);
-                for (size_t i = 0; i < art_method_size; i += sizeof(uint32_t)) {
-                    if (*reinterpret_cast<uint32_t *>(reinterpret_cast<uintptr_t>(first) + i) ==
-                        real_flags) {
-                        access_flags_offset = i;
-                        break;
-                    }
+            auto modifiers_class = env->FindClass("java/lang/reflect/Modifier");
+            auto mask_method = env->GetStaticMethodID(modifiers_class, "methodModifiers", "()I");
+            auto public_mask = env->CallStaticIntMethod(modifiers_class, mask_method);
+            auto get_modifiers = env->GetMethodID(executable.get(), "getModifiers", "()I");
+            if (env->ExceptionCheck() || !public_mask || !get_modifiers) return false;
+            size_t matches = 0;
+            for (auto field : flags_fields) {
+                bool metadata_match = true;
+                std::vector<std::pair<uintptr_t,uint32_t>> samples;
+                auto observe = [&](jobject method, uintptr_t address) {
+                    uint32_t raw = env->GetIntField(method, field);
+                    uint32_t published = env->CallIntMethod(method, get_modifiers);
+                    if (!raw || (raw & public_mask) != (published & public_mask)) metadata_match = false;
+                    samples.emplace_back(address, raw);
+                };
+                for (size_t i = 0; i < constructors.size(); ++i) observe(constructors[i].get(), method_addresses[i]);
+                for (size_t i = 0; i < probes.size(); ++i) observe(probes[i].reflected_method, native_addresses[i]);
+                size_t offset = 0;
+                if (metadata_match && lsplant_layout_probe::flags_offset(samples, art_method_size, kPointerSize, offset) &&
+                    (offset + sizeof(uint32_t) <= data_offset || offset >= data_offset + kPointerSize) &&
+                    (offset + sizeof(uint32_t) <= entry_point_offset || offset >= entry_point_offset + kPointerSize)) {
+                    access_flags_offset = offset; ++matches;
                 }
             }
-            if (access_flags_offset == 0) {
-                LOGW("Failed to find accessFlags field. Fallback to 4.");
-                access_flags_offset = 4U;
+            env->DeleteLocalRef(modifiers_class);
+            if (env->ExceptionCheck() || matches != 1) {
+                LOGE("Missing/ambiguous reflected flags metadata and ArtMethod offset"); return false;
+            }
+            // Public declaring-class identity ties together unrelated methods
+            // from two helper classes and two independent boot classes. Known
+            // flags/data/entry slots are excluded, including pointer high words.
+            auto object_class=JNI_FindClass(env,"java/lang/Object");
+            auto get_methods=JNI_GetMethodID(env,clazz,"getDeclaredMethods","()[Ljava/lang/reflect/Method;");
+            if(!object_class||!get_methods||env->ExceptionCheck())return false;
+            auto object_methods=JNI_Cast<jobjectArray>(JNI_CallObjectMethod(env,object_class,get_methods));
+            if(env->ExceptionCheck()||!object_methods||object_methods.size()<2||object_methods.size()>128)return false;
+            for(auto native_class:native_classes)if(env->IsSameObject(native_class,throwable.get())||env->IsSameObject(native_class,object_class.get()))return false;
+            std::vector<lsplant_layout_probe::ClassWitness> class_samples;
+            auto observe_class=[&](jobject method,uintptr_t address,jclass expected,uint32_t group) {
+                auto declared=JNI_CallObjectMethod(env,method,get_declaring_class);
+                if(env->ExceptionCheck()||!declared||!JNI_IsSameObject(env,declared,expected)||!address||address%sizeof(uint32_t))return false;
+                uint32_t flags=0;std::memcpy(&flags,reinterpret_cast<const void*>(address+access_flags_offset),sizeof(flags));
+                uint32_t published=env->CallIntMethod(method,get_modifiers);
+                if(env->ExceptionCheck()||(flags&public_mask)!=(published&public_mask))return false;
+                class_samples.push_back({address,group});return true;
+            };
+            for(size_t i=0;i<constructors.size();++i)if(!observe_class(constructors[i].get(),method_addresses[i],throwable.get(),0))return false;
+            for(size_t i=0;i<probes.size();++i)if(!observe_class(probes[i].reflected_method,native_addresses[i],probes[i].declaring_class,uint32_t(native_groups[i]+2)))return false;
+            for(size_t i=0;i<object_methods.size();++i) {
+                auto method=object_methods[i];auto address=reinterpret_cast<uintptr_t>(FromReflectedMethod(env,method.get()));
+                if(!observe_class(method.get(),address,object_class.get(),1))return false;
+            }
+            if(!lsplant_layout_probe::class_offset(class_samples,art_method_size,kPointerSize,access_flags_offset,data_offset,entry_point_offset,declaring_class_offset)) {
+                LOGE("Missing/ambiguous declaring-class reference identity layout");return false;
             }
         } else {
             auto art_field = JNI_FindClass(env, "java/lang/reflect/ArtField");
@@ -415,7 +512,7 @@ private:
     inline static size_t interpreter_entry_point_offset = 0;
     inline static size_t data_offset = 0;
     inline static size_t access_flags_offset = 0;
-    inline static size_t declaring_class_offset = 0;
+    inline static size_t declaring_class_offset = std::numeric_limits<size_t>::max();
     inline static uint32_t kAccFastInterpreterToInterpreterInvoke = 0x40000000;
     inline static uint32_t kAccPreCompiled = 0x00200000;
     inline static uint32_t kAccCompileDontBother = 0x02000000;

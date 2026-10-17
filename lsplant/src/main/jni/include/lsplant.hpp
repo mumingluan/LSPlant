@@ -11,6 +11,14 @@
 namespace lsplant {
 
 inline namespace v2 {
+// Local runtime witnesses. They are registered and invoked through public JNI
+// before Init; the reflected objects remain local references throughout Init.
+struct NativeMethodProbe {
+    jobject reflected_method = nullptr;
+    void *native_function = nullptr;
+    void *quick_entry = nullptr;
+    jclass declaring_class = nullptr;
+};
 /// \struct InitInfo
 /// \brief Information and configuration that are needed to call #Init()
 struct InitInfo {
@@ -79,6 +87,7 @@ struct InitInfo {
     /// \brief The memory recycler for executable code. May be null.
     /// It must be non-null if \p executable_memory_allocator is provided.
     MemoryRecycler executable_memory_recycler;
+    std::span<const NativeMethodProbe> native_method_probes;
 };
 
 /// \brief Initialize LSPlant for the proceeding hook.

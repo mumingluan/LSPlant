@@ -1,3 +1,9 @@
+# LSPlant · vivo runtime layout
+
+Fork of [LSPosed/LSPlant](https://github.com/LSPosed/LSPlant), maintained here for [vivo Miuix Shader Fix](https://github.com/mumingluan/vivo-miuix-shader-fix). Changes and scope: [VIVO-PATCH.md](VIVO-PATCH.md).
+
+---
+
 # LSPlant
 
 ![](https://img.shields.io/badge/license-LGPL--3.0-orange.svg)

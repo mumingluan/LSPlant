@@ -167,6 +167,7 @@ private:
 
 struct HookHandler {
     HookHandler(const InitInfo &info) : info_(info) {}
+    auto native_method_probes() const { return info_.native_method_probes; }
 
     template <typename T>
     [[gnu::always_inline]] bool operator()(T &&arg) const {
